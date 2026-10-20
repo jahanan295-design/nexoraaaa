@@ -1,13 +1,16 @@
-name: daily-news
+name: tech-news
 on:
   schedule:
-    - cron: "0 5 * * *"   # every day 05:00 UTC (about 08:30 Tehran)
-  workflow_dispatch: {}    # manual test button
+    - cron: "0 * * * *"   # every hour
+  workflow_dispatch: {}   # manual test button
+permissions:
+  contents: write
 jobs:
   send:
     runs-on: ubuntu-latest
     steps:
-      - name: Send news to Telegram
+      - uses: actions/checkout@v4
+      - name: Send tech news to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -17,37 +20,71 @@ jobs:
           import xml.etree.ElementTree as ET
 
           # ---- settings you can change ----
-          FEEDS = ["https://feeds.bbci.co.uk/persian/rss.xml"]  # BBC Persian. Add more RSS links here.
-          KEYWORDS = []      # e.g. ["ایران", "تهران"]; empty list = send everything
-          MAX_ITEMS = 10     # max news per day
-          HOURS = 24         # only news newer than this
+          FEEDS = [
+              "https://www.theverge.com/rss/index.xml",
+              "https://feeds.arstechnica.com/arstechnica/index",
+              "https://techcrunch.com/feed/",
+              "https://www.wired.com/feed/rss",
+              "https://feeds.bbci.co.uk/news/technology/rss.xml",
+          ]
+          KEYWORDS = []      # e.g. ["AI", "Apple", "Google"]; empty list = all tech news
+          MAX_ITEMS = 3      # max news per run (the newest ones)
+          HOURS = 6          # look back window (safe against GitHub delays)
           # ---------------------------------
 
-          RLM = "\u200f"  # forces right-to-left alignment in Telegram
+          RLM = "\u200f"
+          SENT_FILE = "sent.json"
+          UTC = datetime.timezone.utc
+
+          def local(tag):
+              return tag.rsplit("}", 1)[-1]
+
+          def parse_date(raw):
+              if not raw:
+                  return None
+              try:
+                  d = email.utils.parsedate_to_datetime(raw)
+              except Exception:
+                  try:
+                      d = datetime.datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+                  except Exception:
+                      return None
+              return d if d.tzinfo else d.replace(tzinfo=UTC)
 
           def fetch(url):
               req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
               with urllib.request.urlopen(req, timeout=30) as r:
                   root = ET.fromstring(r.read())
               items = []
-              for it in root.iter("item"):
-                  title = (it.findtext("title") or "").strip()
-                  link = (it.findtext("link") or "").strip()
-                  date = None
-                  raw = it.findtext("pubDate")
-                  if raw:
-                      try:
-                          date = email.utils.parsedate_to_datetime(raw)
-                          if date.tzinfo is None:
-                              date = date.replace(tzinfo=datetime.timezone.utc)
-                      except Exception:
-                          pass
+              for el in root.iter():
+                  kind = local(el.tag)
+                  if kind not in ("item", "entry"):
+                      continue
+                  title = link = raw = None
+                  for ch in el:
+                      n = local(ch.tag)
+                      if n == "title":
+                          title = (ch.text or "").strip()
+                      elif n == "link":
+                          if ch.get("href"):
+                              if ch.get("rel", "alternate") == "alternate" or not link:
+                                  link = ch.get("href").strip()
+                          elif ch.text and not link:
+                              link = ch.text.strip()
+                      elif n in ("pubDate", "published", "updated") and not raw:
+                          raw = ch.text
                   if title and link:
-                      items.append((date, title, link))
+                      items.append((parse_date(raw), title, link))
               return items
 
-          def collect():
-              now = datetime.datetime.now(datetime.timezone.utc)
+          def load_sent():
+              try:
+                  return json.load(open(SENT_FILE))
+              except Exception:
+                  return []
+
+          def collect(sent):
+              now = datetime.datetime.now(UTC)
               limit = now - datetime.timedelta(hours=HOURS)
               found = []
               for url in FEEDS:
@@ -55,29 +92,19 @@ jobs:
                       found += fetch(url)
                   except Exception as e:
                       print("feed failed:", url, e)
-              found = [x for x in found if x[0] is None or x[0] >= limit]
+              found = [x for x in found if x[0] and x[0] >= limit and x[2] not in sent]
               if KEYWORDS:
-                  found = [x for x in found if any(k in x[1] for k in KEYWORDS)]
-              found.sort(key=lambda x: x[0] or now, reverse=True)
-              return found[:MAX_ITEMS]
-
-          def build_messages(items):
-              head = f"{RLM}📰 خبرهای امروز ({datetime.date.today().isoformat()})\n"
-              if not items:
-                  return [head + f"\n{RLM}خبر تازه‌ای پیدا نشد."]
-              msgs, cur = [], head
-              for _, title, link in items:
-                  block = f"\n{RLM}• {title}\n{link}\n"
-                  if len(cur) + len(block) > 3900:
-                      msgs.append(cur)
-                      cur = ""
-                  cur += block
-              msgs.append(cur)
-              return msgs
+                  found = [x for x in found if any(k.lower() in x[1].lower() for k in KEYWORDS)]
+              found.sort(key=lambda x: x[0], reverse=True)
+              seen, uniq = set(), []
+              for x in found:
+                  if x[2] not in seen:
+                      seen.add(x[2]); uniq.append(x)
+              return uniq
 
           def send(text):
               token, chat = os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
-              data = json.dumps({"chat_id": chat, "text": text, "disable_web_page_preview": True}).encode()
+              data = json.dumps({"chat_id": chat, "text": text}).encode()
               req = urllib.request.Request(
                   f"https://api.telegram.org/bot{token}/sendMessage",
                   data=data, headers={"Content-Type": "application/json"},
@@ -85,7 +112,18 @@ jobs:
               urllib.request.urlopen(req, timeout=30).read()
 
           if __name__ == "__main__":
-              for m in build_messages(collect()):
-                  send(m)
-              print("sent")
+              sent = load_sent()
+              items = collect(sent)
+              for _, title, link in items[:MAX_ITEMS]:
+                  send(f"💻 {title}\n{link}")
+              # mark every fresh item as seen so no backlog builds up
+              sent += [x[2] for x in items]
+              json.dump(sent[-500:], open(SENT_FILE, "w"))
+              print("sent", min(len(items), MAX_ITEMS))
           PYEOF
+      - name: Remember what was sent
+        run: |
+          git config user.name "news-bot"
+          git config user.email "news-bot@users.noreply.github.com"
+          git add sent.json
+          git diff --cached --quiet || (git commit -m "update sent list" && git push)
