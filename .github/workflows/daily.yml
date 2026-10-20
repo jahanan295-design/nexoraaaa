@@ -10,10 +10,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Send translated tech news to Telegram
+      - name: Smart tech news to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
         run: |
           python3 - <<'PYEOF'
           import os, re, json, time, html, urllib.request, urllib.parse, datetime, email.utils
@@ -31,6 +32,8 @@ jobs:
           MAX_ITEMS = 3      # max news per run (the newest ones)
           HOURS = 6          # look back window (safe against GitHub delays)
           HASHTAG = "#فناوری"
+          GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]  # tried in order
+          CANDIDATES = 25    # how many fresh news the AI looks at before choosing
           # ---------------------------------
 
           RLM = "\u200f"
@@ -115,6 +118,59 @@ jobs:
                   print("mymemory failed:", e)
               return None
 
+          def post_json(url, payload, headers=None):
+              h = {"Content-Type": "application/json"}
+              h.update(headers or {})
+              req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=h)
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  return json.loads(r.read())
+
+          PROMPT = """تو سردبیر و ادمین یک کانال خبری فناوری به زبان فارسی هستی.
+          فهرست خبرهای تازه (JSON) زیر را بررسی کن و حداکثر {n} خبر را انتخاب کن که واقعاً مهم، معروف و خواندنی هستند
+          (معرفی محصول یا مدل مهم، رویداد بزرگ شرکت‌های مطرح، پیشرفت علمی/فناوری، امنیت و حریم خصوصی مهم، تصمیم‌های اثرگذار).
+          خبرهای تبلیغاتی، تخفیف و فروش، شایعه‌ی ضعیف، کلیک‌طعمه و جزئیات کم‌اهمیت را رد کن.
+          اگر هیچ‌کدام مهم نبود، آرایه‌ی خالی [] برگردان.
+
+          برای هر خبر انتخاب‌شده فقط با تکیه بر اطلاعات همان خبر (چیزی از خودت اضافه نکن و عدد و نام را عوض نکن) بنویس:
+          - id: همان id ورودی
+          - title_fa: تیتر جذاب، روان و کوتاه به فارسی
+          - summary_fa: خلاصه‌ی ۲ تا ۳ جمله‌ای به فارسی ساده و روان
+          - why_fa: یک جمله که می‌گوید چرا این خبر مهم است (اگر از متن مشخص نیست، رشته‌ی خالی)
+          - tags: یک یا دو هشتگ فارسی بدون فاصله (با خط‌زیر)، مثلاً "هوش_مصنوعی"
+          نام برندها و محصولات (Apple, OpenAI, iPhone ...) را به انگلیسی بنویس.
+          خروجی فقط یک آرایه‌ی JSON معتبر باشد، بدون هیچ متن دیگر.
+
+          خبرها:
+          {items}"""
+
+          def ai_select(cands):
+              key = os.environ.get("GEMINI_API_KEY")
+              if not key:
+                  return None
+              pool = [{"id": i, "source": c[4], "title": c[1], "text": c[2]} for i, c in enumerate(cands)]
+              prompt = PROMPT.format(n=MAX_ITEMS, items=json.dumps(pool, ensure_ascii=False))
+              body = {"contents": [{"parts": [{"text": prompt}]}],
+                      "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}}
+              for model in GEMINI_MODELS:
+                  try:
+                      url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+                      r = post_json(url, body, {"x-goog-api-key": key})
+                      text = r["candidates"][0]["content"]["parts"][0]["text"]
+                      data = json.loads(text)
+                      if isinstance(data, list):
+                          return data
+                  except Exception as e:
+                      print("gemini failed:", model, e)
+              return None
+
+          def ai_post(c, a):
+              lines = [f"{RLM}🔥 {a['title_fa'].strip()}", "", f"{RLM}{a['summary_fa'].strip()}"]
+              if a.get("why_fa"):
+                  lines += ["", f"{RLM}💡 {a['why_fa'].strip()}"]
+              tags = " ".join("#" + t.strip("# ") for t in a.get("tags", [])[:2] if t.strip("# "))
+              lines += ["", f"{RLM}🔗 منبع: {c[4]}", c[3], "", f"{RLM}{tags + ' ' if tags else ''}{HASHTAG}"]
+              return "\n".join(lines)
+
           def load_sent():
               try:
                   return json.load(open(SENT_FILE))
@@ -169,11 +225,24 @@ jobs:
           if __name__ == "__main__":
               sent = load_sent()
               items = collect(sent)
-              for _, title, desc, link, source in items[:MAX_ITEMS]:
-                  send(build_post(title, desc, link, source))
+              cands = items[:CANDIDATES]
+              picked = ai_select(cands)
+              count = 0
+              if picked is not None:  # AI mode: only the important ones
+                  for a in picked[:MAX_ITEMS]:
+                      try:
+                          c = cands[int(a["id"])]
+                          send(ai_post(c, a))
+                          count += 1
+                      except Exception as e:
+                          print("skip bad item:", e)
+              else:  # fallback: plain translation of the newest items
+                  for _, title, desc, link, source in items[:MAX_ITEMS]:
+                      send(build_post(title, desc, link, source))
+                      count += 1
               sent += [x[3] for x in items]
               json.dump(sent[-500:], open(SENT_FILE, "w"))
-              print("sent", min(len(items), MAX_ITEMS))
+              print("sent", count)
           PYEOF
       - name: Remember what was sent
         run: |
