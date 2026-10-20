@@ -10,26 +10,27 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Send tech news to Telegram
+      - name: Send translated tech news to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python3 - <<'PYEOF'
-          import os, json, urllib.request, datetime, email.utils
+          import os, re, json, time, html, urllib.request, urllib.parse, datetime, email.utils
           import xml.etree.ElementTree as ET
 
           # ---- settings you can change ----
           FEEDS = [
-              "https://www.theverge.com/rss/index.xml",
-              "https://feeds.arstechnica.com/arstechnica/index",
-              "https://techcrunch.com/feed/",
-              "https://www.wired.com/feed/rss",
-              "https://feeds.bbci.co.uk/news/technology/rss.xml",
+              ("The Verge", "https://www.theverge.com/rss/index.xml"),
+              ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
+              ("TechCrunch", "https://techcrunch.com/feed/"),
+              ("Wired", "https://www.wired.com/feed/rss"),
+              ("BBC", "https://feeds.bbci.co.uk/news/technology/rss.xml"),
           ]
           KEYWORDS = []      # e.g. ["AI", "Apple", "Google"]; empty list = all tech news
           MAX_ITEMS = 3      # max news per run (the newest ones)
           HOURS = 6          # look back window (safe against GitHub delays)
+          HASHTAG = "#فناوری"
           # ---------------------------------
 
           RLM = "\u200f"
@@ -38,6 +39,15 @@ jobs:
 
           def local(tag):
               return tag.rsplit("}", 1)[-1]
+
+          def clean(text, limit=300):
+              t = html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
+              t = re.sub(r"\s+", " ", t).strip()
+              if len(t) > limit:
+                  cut = t[:limit]
+                  end = max(cut.rfind(". "), cut.rfind("! "), cut.rfind("? "))
+                  t = cut[: end + 1] if end > 80 else cut.rsplit(" ", 1)[0] + "…"
+              return t
 
           def parse_date(raw):
               if not raw:
@@ -51,16 +61,18 @@ jobs:
                       return None
               return d if d.tzinfo else d.replace(tzinfo=UTC)
 
-          def fetch(url):
+          def get(url):
               req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
               with urllib.request.urlopen(req, timeout=30) as r:
-                  root = ET.fromstring(r.read())
+                  return r.read()
+
+          def fetch(name, url):
+              root = ET.fromstring(get(url))
               items = []
               for el in root.iter():
-                  kind = local(el.tag)
-                  if kind not in ("item", "entry"):
+                  if local(el.tag) not in ("item", "entry"):
                       continue
-                  title = link = raw = None
+                  title = link = raw = desc = None
                   for ch in el:
                       n = local(ch.tag)
                       if n == "title":
@@ -73,9 +85,35 @@ jobs:
                               link = ch.text.strip()
                       elif n in ("pubDate", "published", "updated") and not raw:
                           raw = ch.text
+                      elif n in ("description", "summary") and not desc:
+                          desc = ch.text
                   if title and link:
-                      items.append((parse_date(raw), title, link))
+                      items.append((parse_date(raw), title, clean(desc), link, name))
               return items
+
+          def translate(text):
+              """English -> Persian. Tries two free services; returns None if both fail."""
+              if not text:
+                  return ""
+              try:  # 1) Google Translate public endpoint (unofficial)
+                  q = urllib.parse.quote(text)
+                  url = ("https://translate.googleapis.com/translate_a/single"
+                         f"?client=gtx&sl=en&tl=fa&dt=t&q={q}")
+                  data = json.loads(get(url))
+                  out = "".join(part[0] for part in data[0] if part and part[0])
+                  if out.strip():
+                      return out.strip()
+              except Exception as e:
+                  print("google translate failed:", e)
+              try:  # 2) MyMemory (free, limited daily quota)
+                  q = urllib.parse.quote(text[:450])
+                  data = json.loads(get(f"https://api.mymemory.translated.net/get?q={q}&langpair=en|fa"))
+                  out = data["responseData"]["translatedText"]
+                  if out and "MYMEMORY" not in out.upper():
+                      return out.strip()
+              except Exception as e:
+                  print("mymemory failed:", e)
+              return None
 
           def load_sent():
               try:
@@ -87,24 +125,41 @@ jobs:
               now = datetime.datetime.now(UTC)
               limit = now - datetime.timedelta(hours=HOURS)
               found = []
-              for url in FEEDS:
+              for name, url in FEEDS:
                   try:
-                      found += fetch(url)
+                      found += fetch(name, url)
                   except Exception as e:
                       print("feed failed:", url, e)
-              found = [x for x in found if x[0] and x[0] >= limit and x[2] not in sent]
+              found = [x for x in found if x[0] and x[0] >= limit and x[3] not in sent]
               if KEYWORDS:
                   found = [x for x in found if any(k.lower() in x[1].lower() for k in KEYWORDS)]
               found.sort(key=lambda x: x[0], reverse=True)
               seen, uniq = set(), []
               for x in found:
-                  if x[2] not in seen:
-                      seen.add(x[2]); uniq.append(x)
+                  if x[3] not in seen:
+                      seen.add(x[3]); uniq.append(x)
               return uniq
+
+          def build_post(title, desc, link, source):
+              t_fa = translate(title)
+              time.sleep(1)
+              d_fa = translate(desc) if desc else ""
+              time.sleep(1)
+              lines = []
+              if t_fa:
+                  lines.append(f"{RLM}📰 {t_fa}")
+                  if d_fa:
+                      lines += ["", f"{RLM}{d_fa}"]
+              else:  # translation failed: keep the English so nothing is lost
+                  lines.append(f"📰 {title}")
+                  if desc:
+                      lines += ["", desc]
+              lines += ["", f"{RLM}🔗 منبع: {source}", link, "", f"{RLM}{HASHTAG}"]
+              return "\n".join(lines)
 
           def send(text):
               token, chat = os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
-              data = json.dumps({"chat_id": chat, "text": text}).encode()
+              data = json.dumps({"chat_id": chat, "text": text[:4000], "disable_web_page_preview": False}).encode()
               req = urllib.request.Request(
                   f"https://api.telegram.org/bot{token}/sendMessage",
                   data=data, headers={"Content-Type": "application/json"},
@@ -114,10 +169,9 @@ jobs:
           if __name__ == "__main__":
               sent = load_sent()
               items = collect(sent)
-              for _, title, link in items[:MAX_ITEMS]:
-                  send(f"💻 {title}\n{link}")
-              # mark every fresh item as seen so no backlog builds up
-              sent += [x[2] for x in items]
+              for _, title, desc, link, source in items[:MAX_ITEMS]:
+                  send(build_post(title, desc, link, source))
+              sent += [x[3] for x in items]
               json.dump(sent[-500:], open(SENT_FILE, "w"))
               print("sent", min(len(items), MAX_ITEMS))
           PYEOF
