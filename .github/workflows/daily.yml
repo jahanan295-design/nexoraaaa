@@ -1,4 +1,4 @@
-name: tech-news
+name: smart-news
 on:
   schedule:
     - cron: "0 * * * *"   # every hour
@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Smart tech news to Telegram
+      - name: Send Iran + tech news to Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -20,28 +20,44 @@ jobs:
           import os, re, json, time, html, urllib.request, urllib.parse, datetime, email.utils
           import xml.etree.ElementTree as ET
 
-          # ---- settings you can change ----
-          FEEDS = [
-              ("The Verge", "https://www.theverge.com/rss/index.xml"),
-              ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index"),
-              ("TechCrunch", "https://techcrunch.com/feed/"),
-              ("Wired", "https://www.wired.com/feed/rss"),
-              ("BBC", "https://feeds.bbci.co.uk/news/technology/rss.xml"),
+          # ---------------- settings you can change ----------------
+          CATEGORIES = [
+              {
+                  "name": "iran", "emoji": "🚨", "tag": "#ایران #خبر_فوری", "max": 5, "keywords": [],
+                  "focus": "اخبار جنگ و بحران ایران و منطقه (درگیری نظامی ایران با آمریکا و اسرائیل، تنگه‌ی هرمز، "
+                           "مذاکرات و دیپلماسی، تحریم و محاصره، پیامدهای اقتصادی و انسانی، تحولات داخلی ایران)",
+                  "feeds": [
+                      ("BBC فارسی", "https://feeds.bbci.co.uk/persian/rss.xml", False),
+                      ("BBC", "https://feeds.bbci.co.uk/news/world/middle_east/rss.xml", True),
+                      ("Al Jazeera", "https://www.aljazeera.com/xml/rss/all.xml", True),
+                      ("The Guardian", "https://www.theguardian.com/world/iran/rss", False),
+                  ],
+                  "match": ["iran", "tehran", "hormuz", "irgc", "ایران", "تهران", "هرمز", "سپاه"],
+              },
+              {
+                  "name": "tech", "emoji": "🔥", "tag": "#فناوری", "max": 5, "keywords": [],
+                  "focus": "اخبار فناوری (هوش مصنوعی، موبایل و سخت‌افزار، نرم‌افزار، اینترنت، امنیت سایبری، علم و فضا)",
+                  "feeds": [
+                      ("The Verge", "https://www.theverge.com/rss/index.xml", False),
+                      ("Ars Technica", "https://feeds.arstechnica.com/arstechnica/index", False),
+                      ("TechCrunch", "https://techcrunch.com/feed/", False),
+                      ("Wired", "https://www.wired.com/feed/rss", False),
+                      ("BBC", "https://feeds.bbci.co.uk/news/technology/rss.xml", False),
+                  ],
+                  "match": [],
+              },
           ]
-          KEYWORDS = []      # e.g. ["AI", "Apple", "Google"]; empty list = all tech news
-          MAX_ITEMS = 3      # max news per run (the newest ones)
-          HOURS = 6          # look back window (safe against GitHub delays)
-          HASHTAG = "#فناوری"
-          GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]  # tried in order
-          CANDIDATES = 25    # how many fresh news the AI looks at before choosing
-          # ---------------------------------
+          HOURS = 6          # look-back window (safe against GitHub delays)
+          CANDIDATES = 25    # how many fresh news the AI reads per category
+          GEMINI_MODELS = ["gemini-2.5-flash-lite", "gemini-2.5-flash"]
+          # ---------------------------------------------------------
 
           RLM = "\u200f"
           SENT_FILE = "sent.json"
           UTC = datetime.timezone.utc
+          FA = re.compile(r"[\u0600-\u06FF]")
 
-          def local(tag):
-              return tag.rsplit("}", 1)[-1]
+          def local(t): return t.rsplit("}", 1)[-1]
 
           def clean(text, limit=300):
               t = html.unescape(re.sub(r"<[^>]+>", " ", text or ""))
@@ -53,15 +69,12 @@ jobs:
               return t
 
           def parse_date(raw):
-              if not raw:
-                  return None
+              if not raw: return None
               try:
                   d = email.utils.parsedate_to_datetime(raw)
               except Exception:
-                  try:
-                      d = datetime.datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
-                  except Exception:
-                      return None
+                  try: d = datetime.datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+                  except Exception: return None
               return d if d.tzinfo else d.replace(tzinfo=UTC)
 
           def get(url):
@@ -69,180 +82,146 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as r:
                   return r.read()
 
+          def post_json(url, payload, headers=None):
+              h = {"Content-Type": "application/json"}; h.update(headers or {})
+              req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=h)
+              with urllib.request.urlopen(req, timeout=90) as r:
+                  return json.loads(r.read())
+
           def fetch(name, url):
               root = ET.fromstring(get(url))
               items = []
               for el in root.iter():
-                  if local(el.tag) not in ("item", "entry"):
-                      continue
+                  if local(el.tag) not in ("item", "entry"): continue
                   title = link = raw = desc = None
                   for ch in el:
                       n = local(ch.tag)
-                      if n == "title":
-                          title = (ch.text or "").strip()
+                      if n == "title": title = (ch.text or "").strip()
                       elif n == "link":
                           if ch.get("href"):
-                              if ch.get("rel", "alternate") == "alternate" or not link:
-                                  link = ch.get("href").strip()
-                          elif ch.text and not link:
-                              link = ch.text.strip()
-                      elif n in ("pubDate", "published", "updated") and not raw:
-                          raw = ch.text
-                      elif n in ("description", "summary") and not desc:
-                          desc = ch.text
+                              if ch.get("rel", "alternate") == "alternate" or not link: link = ch.get("href").strip()
+                          elif ch.text and not link: link = ch.text.strip()
+                      elif n in ("pubDate", "published", "updated") and not raw: raw = ch.text
+                      elif n in ("description", "summary") and not desc: desc = ch.text
                   if title and link:
                       items.append((parse_date(raw), title, clean(desc), link, name))
               return items
 
           def translate(text):
-              """English -> Persian. Tries two free services; returns None if both fail."""
-              if not text:
-                  return ""
-              try:  # 1) Google Translate public endpoint (unofficial)
+              if not text: return ""
+              if FA.search(text): return text  # already Persian
+              try:
                   q = urllib.parse.quote(text)
-                  url = ("https://translate.googleapis.com/translate_a/single"
-                         f"?client=gtx&sl=en&tl=fa&dt=t&q={q}")
-                  data = json.loads(get(url))
-                  out = "".join(part[0] for part in data[0] if part and part[0])
-                  if out.strip():
-                      return out.strip()
+                  data = json.loads(get("https://translate.googleapis.com/translate_a/single"
+                                        f"?client=gtx&sl=en&tl=fa&dt=t&q={q}"))
+                  out = "".join(p[0] for p in data[0] if p and p[0]).strip()
+                  if out: return out
               except Exception as e:
-                  print("google translate failed:", e)
-              try:  # 2) MyMemory (free, limited daily quota)
-                  q = urllib.parse.quote(text[:450])
-                  data = json.loads(get(f"https://api.mymemory.translated.net/get?q={q}&langpair=en|fa"))
-                  out = data["responseData"]["translatedText"]
-                  if out and "MYMEMORY" not in out.upper():
-                      return out.strip()
-              except Exception as e:
-                  print("mymemory failed:", e)
+                  print("translate failed:", e)
               return None
 
-          def post_json(url, payload, headers=None):
-              h = {"Content-Type": "application/json"}
-              h.update(headers or {})
-              req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers=h)
-              with urllib.request.urlopen(req, timeout=90) as r:
-                  return json.loads(r.read())
+          PROMPT = """تو سردبیر و ادمین یک کانال خبری به زبان فارسی هستی. موضوع این بخش: {focus}.
+          فهرست خبرهای تازه (JSON) زیر را بررسی کن و تا {n} خبر مرتبط و مهم انتخاب کن.
+          اگر بیش از ۳ خبر درخور انتشار هست، {n} تا را انتخاب کن؛ فقط خبرهای تبلیغاتی، تکراری، بی‌ربط یا بسیار کم‌اهمیت را رد کن.
+          اگر واقعاً هیچ خبر مرتبطی نیست، آرایه‌ی خالی [] برگردان.
 
-          PROMPT = """تو سردبیر و ادمین یک کانال خبری فناوری به زبان فارسی هستی.
-          فهرست خبرهای تازه (JSON) زیر را بررسی کن و حداکثر {n} خبر را انتخاب کن که واقعاً مهم، معروف و خواندنی هستند
-          (معرفی محصول یا مدل مهم، رویداد بزرگ شرکت‌های مطرح، پیشرفت علمی/فناوری، امنیت و حریم خصوصی مهم، تصمیم‌های اثرگذار).
-          خبرهای تبلیغاتی، تخفیف و فروش، شایعه‌ی ضعیف، کلیک‌طعمه و جزئیات کم‌اهمیت را رد کن.
-          اگر هیچ‌کدام مهم نبود، آرایه‌ی خالی [] برگردان.
+          قواعد دقت و بی‌طرفی:
+          - فقط از اطلاعات همان خبر استفاده کن؛ چیزی از خودت اضافه نکن و عدد، نام و تاریخ را عوض نکن.
+          - ادعاهای طرف‌های درگیر را با «به گفته‌ی …» یا «طبق گزارش …» نسبت بده و آن‌ها را حقیقت قطعی ننویس.
+          - لحن خبری، بی‌طرف و آرام باشد؛ بدون هیجان‌سازی، تحقیر یا جانب‌داری.
+          - اگر خبر تأییدنشده است، بنویس «تأیید مستقل نشده».
 
-          برای هر خبر انتخاب‌شده فقط با تکیه بر اطلاعات همان خبر (چیزی از خودت اضافه نکن و عدد و نام را عوض نکن) بنویس:
+          برای هر خبر انتخاب‌شده بنویس:
           - id: همان id ورودی
-          - title_fa: تیتر جذاب، روان و کوتاه به فارسی
+          - title_fa: تیتر روشن و کوتاه به فارسی
           - summary_fa: خلاصه‌ی ۲ تا ۳ جمله‌ای به فارسی ساده و روان
-          - why_fa: یک جمله که می‌گوید چرا این خبر مهم است (اگر از متن مشخص نیست، رشته‌ی خالی)
-          - tags: یک یا دو هشتگ فارسی بدون فاصله (با خط‌زیر)، مثلاً "هوش_مصنوعی"
-          نام برندها و محصولات (Apple, OpenAI, iPhone ...) را به انگلیسی بنویس.
+          - why_fa: یک جمله درباره‌ی اهمیت خبر (اگر از متن مشخص نیست، رشته‌ی خالی)
+          - tags: یک یا دو هشتگ فارسی بدون فاصله (با خط‌زیر)
+          نام برندها و محصولات را به انگلیسی بنویس.
           خروجی فقط یک آرایه‌ی JSON معتبر باشد، بدون هیچ متن دیگر.
 
           خبرها:
           {items}"""
 
-          def ai_select(cands):
+          def ai_select(cat, cands):
               key = os.environ.get("GEMINI_API_KEY")
-              if not key:
-                  return None
+              if not key or not cands: return None
               pool = [{"id": i, "source": c[4], "title": c[1], "text": c[2]} for i, c in enumerate(cands)]
-              prompt = PROMPT.format(n=MAX_ITEMS, items=json.dumps(pool, ensure_ascii=False))
+              prompt = PROMPT.format(focus=cat["focus"], n=cat["max"], items=json.dumps(pool, ensure_ascii=False))
               body = {"contents": [{"parts": [{"text": prompt}]}],
-                      "generationConfig": {"temperature": 0.3, "responseMimeType": "application/json"}}
+                      "generationConfig": {"temperature": 0.2, "responseMimeType": "application/json"}}
               for model in GEMINI_MODELS:
                   try:
-                      url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-                      r = post_json(url, body, {"x-goog-api-key": key})
-                      text = r["candidates"][0]["content"]["parts"][0]["text"]
-                      data = json.loads(text)
-                      if isinstance(data, list):
-                          return data
+                      r = post_json("https://generativelanguage.googleapis.com/v1beta/models/"
+                                    f"{model}:generateContent", body, {"x-goog-api-key": key})
+                      data = json.loads(r["candidates"][0]["content"]["parts"][0]["text"])
+                      if isinstance(data, list): return data
                   except Exception as e:
                       print("gemini failed:", model, e)
               return None
 
-          def ai_post(c, a):
-              lines = [f"{RLM}🔥 {a['title_fa'].strip()}", "", f"{RLM}{a['summary_fa'].strip()}"]
-              if a.get("why_fa"):
-                  lines += ["", f"{RLM}💡 {a['why_fa'].strip()}"]
+          def ai_post(cat, c, a):
               tags = " ".join("#" + t.strip("# ") for t in a.get("tags", [])[:2] if t.strip("# "))
-              lines += ["", f"{RLM}🔗 منبع: {c[4]}", c[3], "", f"{RLM}{tags + ' ' if tags else ''}{HASHTAG}"]
+              lines = [f"{RLM}{cat['emoji']} {a['title_fa'].strip()}", "", f"{RLM}{a['summary_fa'].strip()}"]
+              if a.get("why_fa"): lines += ["", f"{RLM}💡 {a['why_fa'].strip()}"]
+              lines += ["", f"{RLM}🔗 منبع: {c[4]}", c[3], "", f"{RLM}{tags + ' ' if tags else ''}{cat['tag']}"]
               return "\n".join(lines)
 
-          def load_sent():
-              try:
-                  return json.load(open(SENT_FILE))
-              except Exception:
-                  return []
-
-          def collect(sent):
-              now = datetime.datetime.now(UTC)
-              limit = now - datetime.timedelta(hours=HOURS)
-              found = []
-              for name, url in FEEDS:
-                  try:
-                      found += fetch(name, url)
-                  except Exception as e:
-                      print("feed failed:", url, e)
-              found = [x for x in found if x[0] and x[0] >= limit and x[3] not in sent]
-              if KEYWORDS:
-                  found = [x for x in found if any(k.lower() in x[1].lower() for k in KEYWORDS)]
-              found.sort(key=lambda x: x[0], reverse=True)
-              seen, uniq = set(), []
-              for x in found:
-                  if x[3] not in seen:
-                      seen.add(x[3]); uniq.append(x)
-              return uniq
-
-          def build_post(title, desc, link, source):
-              t_fa = translate(title)
-              time.sleep(1)
-              d_fa = translate(desc) if desc else ""
-              time.sleep(1)
-              lines = []
-              if t_fa:
-                  lines.append(f"{RLM}📰 {t_fa}")
-                  if d_fa:
-                      lines += ["", f"{RLM}{d_fa}"]
-              else:  # translation failed: keep the English so nothing is lost
-                  lines.append(f"📰 {title}")
-                  if desc:
-                      lines += ["", desc]
-              lines += ["", f"{RLM}🔗 منبع: {source}", link, "", f"{RLM}{HASHTAG}"]
+          def plain_post(cat, c):
+              t = translate(c[1]); time.sleep(1)
+              d = translate(c[2]) if c[2] else ""; time.sleep(1)
+              lines = [f"{RLM}{cat['emoji']} {t or c[1]}"]
+              if d or c[2]: lines += ["", f"{RLM}{d or c[2]}"]
+              lines += ["", f"{RLM}🔗 منبع: {c[4]}", c[3], "", f"{RLM}{cat['tag']}"]
               return "\n".join(lines)
 
           def send(text):
               token, chat = os.environ["TELEGRAM_BOT_TOKEN"], os.environ["TELEGRAM_CHAT_ID"]
-              data = json.dumps({"chat_id": chat, "text": text[:4000], "disable_web_page_preview": False}).encode()
-              req = urllib.request.Request(
-                  f"https://api.telegram.org/bot{token}/sendMessage",
-                  data=data, headers={"Content-Type": "application/json"},
-              )
-              urllib.request.urlopen(req, timeout=30).read()
+              post_json(f"https://api.telegram.org/bot{token}/sendMessage",
+                        {"chat_id": chat, "text": text[:4000]})
+              time.sleep(2)
+
+          def load_sent():
+              try: return json.load(open(SENT_FILE))
+              except Exception: return []
+
+          def candidates(cat, sent, taken):
+              limit = datetime.datetime.now(UTC) - datetime.timedelta(hours=HOURS)
+              found = []
+              for name, url, filt in cat["feeds"]:
+                  try:
+                      for x in fetch(name, url):
+                          if filt and not any(k in (x[1] + " " + x[2]).lower() for k in cat["match"]): continue
+                          found.append(x)
+                  except Exception as e:
+                      print("feed failed:", url, e)
+              found = [x for x in found if x[0] and x[0] >= limit and x[3] not in sent and x[3] not in taken]
+              found.sort(key=lambda x: x[0], reverse=True)
+              out, seen = [], set()
+              for x in found:
+                  if x[3] not in seen:
+                      seen.add(x[3]); out.append(x)
+              return out[:CANDIDATES]
 
           if __name__ == "__main__":
-              sent = load_sent()
-              items = collect(sent)
-              cands = items[:CANDIDATES]
-              picked = ai_select(cands)
-              count = 0
-              if picked is not None:  # AI mode: only the important ones
-                  for a in picked[:MAX_ITEMS]:
-                      try:
-                          c = cands[int(a["id"])]
-                          send(ai_post(c, a))
-                          count += 1
-                      except Exception as e:
-                          print("skip bad item:", e)
-              else:  # fallback: plain translation of the newest items
-                  for _, title, desc, link, source in items[:MAX_ITEMS]:
-                      send(build_post(title, desc, link, source))
-                      count += 1
-              sent += [x[3] for x in items]
-              json.dump(sent[-500:], open(SENT_FILE, "w"))
-              print("sent", count)
+              sent, taken = load_sent(), set()
+              for cat in CATEGORIES:
+                  cands = candidates(cat, sent, taken)
+                  taken |= {c[3] for c in cands}
+                  picked = ai_select(cat, cands)
+                  count = 0
+                  if picked is not None:
+                      for a in picked[: cat["max"]]:
+                          try:
+                              send(ai_post(cat, cands[int(a["id"])], a)); count += 1
+                          except Exception as e:
+                              print("skip bad item:", e)
+                  else:  # no AI available: plain translation of the newest items
+                      for c in cands[: cat["max"]]:
+                          send(plain_post(cat, c)); count += 1
+                  sent += [c[3] for c in cands]
+                  print(cat["name"], "candidates", len(cands), "sent", count)
+              json.dump(sent[-800:], open(SENT_FILE, "w"))
           PYEOF
       - name: Remember what was sent
         run: |
